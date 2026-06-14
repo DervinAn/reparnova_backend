@@ -3,7 +3,7 @@ import asyncio
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from database import activate_store, get_device_by_key, init_db, touch_device
+from database import activate_store, get_device_by_fingerprint, get_device_by_key, init_db, touch_device
 from routes.analytics import router as analytics_router
 from routes.categories import router as categories_router
 from routes.customers import router as customers_router
@@ -66,13 +66,19 @@ async def store_context_middleware(request: Request, call_next):
     store = await run_in_threadpool(activate_store, code=store_code, store_id=store_id)
 
     device_key = request.headers.get("X-Device-Key")
+    device_fingerprint = request.headers.get("X-Device-Fingerprint", "")
     if device_key:
         device = await run_in_threadpool(get_device_by_key, device_key)
+        if device is None or int(device["store_id"]) != int(store["id"]):
+            if device_fingerprint:
+                fallback_device = await run_in_threadpool(get_device_by_fingerprint, device_fingerprint)
+                if fallback_device is not None and int(fallback_device["store_id"]) == int(store["id"]):
+                    device = fallback_device
         if device is None or int(device["store_id"]) != int(store["id"]):
             from fastapi.responses import JSONResponse
 
             return JSONResponse(status_code=401, content={"detail": "Invalid device key"})
-        await run_in_threadpool(touch_device, device_key)
+        await run_in_threadpool(touch_device, device["device_key"])
 
     response = await call_next(request)
     return response

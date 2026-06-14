@@ -914,6 +914,18 @@ def get_device_by_key(device_key: str) -> dict[str, Any] | None:
     return row_to_dict(row)
 
 
+def get_device_by_fingerprint(device_fingerprint: str) -> dict[str, Any] | None:
+    fingerprint = device_fingerprint.strip()
+    if not fingerprint:
+        return None
+    with get_master_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM devices WHERE device_fingerprint = ? ORDER BY id DESC LIMIT 1",
+            (fingerprint,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
 def touch_device(device_key: str) -> None:
     with get_master_connection() as conn:
         conn.execute("UPDATE devices SET last_seen = ? WHERE device_key = ?", (datetime_now(), device_key))
