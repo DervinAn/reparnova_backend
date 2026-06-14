@@ -367,7 +367,10 @@ def master_schema_statements() -> list[str]:
             name TEXT NOT NULL,
             platform TEXT NOT NULL DEFAULT 'desktop',
             device_key TEXT NOT NULL UNIQUE,
+            device_fingerprint TEXT NOT NULL DEFAULT '',
             active INTEGER NOT NULL DEFAULT 1,
+            requested_at TEXT NOT NULL DEFAULT '',
+            approved_at TEXT NOT NULL DEFAULT '',
             last_seen TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             FOREIGN KEY(store_id) REFERENCES stores(id) ON DELETE CASCADE
@@ -398,6 +401,7 @@ def init_master_db() -> None:
         for statement in master_schema_statements():
             conn.execute(statement)
         _ensure_master_store_columns(conn)
+        _ensure_master_device_columns(conn)
 
 
 def _ensure_master_store_columns(conn: sqlite3.Connection) -> None:
@@ -423,6 +427,22 @@ def _ensure_master_store_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_stores_license_key ON stores(license_key) WHERE license_key <> ''"
     )
+
+
+def _ensure_master_device_columns(conn: sqlite3.Connection) -> None:
+    existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(devices)").fetchall()}
+    migrations = [
+        ("device_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+        ("requested_at", "TEXT NOT NULL DEFAULT ''"),
+        ("approved_at", "TEXT NOT NULL DEFAULT ''"),
+    ]
+    for column_name, column_sql in migrations:
+        if column_name not in existing_columns:
+            conn.execute(f"ALTER TABLE devices ADD COLUMN {column_name} {column_sql}")
+
+    conn.execute("UPDATE devices SET device_fingerprint = COALESCE(device_fingerprint, '') WHERE device_fingerprint IS NULL")
+    conn.execute("UPDATE devices SET requested_at = COALESCE(requested_at, '') WHERE requested_at IS NULL")
+    conn.execute("UPDATE devices SET approved_at = COALESCE(approved_at, '') WHERE approved_at IS NULL")
 
 
 def init_db() -> None:
@@ -537,18 +557,34 @@ def list_stores() -> list[dict[str, Any]]:
             """
             SELECT
                 stores.*,
-                COALESCE(device_counts.device_count, 0) AS device_count
+                COALESCE(device_counts.device_count, 0) AS device_count,
+                COALESCE(pending_counts.pending_device_count, 0) AS pending_device_count
             FROM stores
             LEFT JOIN (
                 SELECT store_id, COUNT(*) AS device_count
                 FROM devices
+                WHERE active = 1
                 GROUP BY store_id
             ) AS device_counts ON device_counts.store_id = stores.id
+            LEFT JOIN (
+                SELECT store_id, COUNT(*) AS pending_device_count
+                FROM devices
+                WHERE active = 0
+                GROUP BY store_id
+            ) AS pending_counts ON pending_counts.store_id = stores.id
             WHERE stores.code <> 'default'
             ORDER BY stores.id
             """
         ).fetchall()
-    return [row_to_dict(row) for row in rows if row is not None]
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        if row is None:
+            continue
+        payload = row_to_dict(row) or {}
+        payload["device_count"] = int(payload.get("device_count") or 0)
+        payload["pending_device_count"] = int(payload.get("pending_device_count") or 0)
+        result.append(payload)
+    return result
 
 
 def get_store_by_id(store_id: int) -> dict[str, Any] | None:
@@ -696,6 +732,63 @@ def generate_store_code(name: str = "") -> str:
     return f"{base}-{suffix}"
 
 
+def _device_count(conn: sqlite3.Connection, store_id: int, *, active: int | None = None) -> int:
+    query = "SELECT COUNT(*) AS count FROM devices WHERE store_id = ?"
+    params: list[Any] = [store_id]
+    if active is not None:
+        query += " AND active = ?"
+        params.append(active)
+    row = conn.execute(query, tuple(params)).fetchone()
+    return int((row or {"count": 0})["count"])
+
+
+def _insert_device(
+    conn: sqlite3.Connection,
+    *,
+    store_id: int,
+    name: str,
+    platform: str,
+    device_key: str,
+    device_fingerprint: str = "",
+    active: int = 1,
+    requested_at: str = "",
+    approved_at: str = "",
+    last_seen: str = "",
+) -> dict[str, Any]:
+    now = datetime_now()
+    cursor = conn.execute(
+        """
+        INSERT INTO devices (
+            store_id,
+            name,
+            platform,
+            device_key,
+            device_fingerprint,
+            active,
+            requested_at,
+            approved_at,
+            last_seen,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            store_id,
+            name,
+            platform,
+            device_key,
+            device_fingerprint,
+            int(active),
+            requested_at,
+            approved_at,
+            last_seen,
+            now,
+        ),
+    )
+    row = conn.execute("SELECT * FROM devices WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    return row_to_dict(row) or {}
+
+
 def create_device(store_id: int, name: str, platform: str = "desktop") -> dict[str, Any]:
     device_key = uuid.uuid4().hex
     now = datetime_now()
@@ -706,22 +799,107 @@ def create_device(store_id: int, name: str, platform: str = "desktop") -> dict[s
         ).fetchone()
         if store_row is None:
             return {}
-        current_count = conn.execute(
-            "SELECT COUNT(*) AS count FROM devices WHERE store_id = ? AND active = 1",
-            (store_id,),
-        ).fetchone()["count"]
+        current_count = _device_count(conn, store_id, active=1)
         device_limit = int(store_row["device_limit"] or 0)
         if current_count >= device_limit:
             raise ValueError("Device limit reached for this shop")
-        cursor = conn.execute(
-            """
-            INSERT INTO devices (store_id, name, platform, device_key, active, last_seen, created_at)
-            VALUES (?, ?, ?, ?, 1, ?, ?)
-            """,
-            (store_id, name, platform, device_key, now, now),
+        row = _insert_device(
+            conn,
+            store_id=store_id,
+            name=name,
+            platform=platform,
+            device_key=device_key,
+            active=1,
+            approved_at=now,
+            last_seen=now,
         )
-        row = conn.execute("SELECT * FROM devices WHERE id = ?", (cursor.lastrowid,)).fetchone()
-    return row_to_dict(row) or {}
+    return row
+
+
+def request_device_activation(
+    store_id: int,
+    *,
+    name: str,
+    platform: str = "desktop",
+    device_fingerprint: str,
+) -> dict[str, Any]:
+    fingerprint = device_fingerprint.strip()
+    if not fingerprint:
+        raise ValueError("Device fingerprint is required")
+
+    now = datetime_now()
+    with get_master_connection() as conn:
+        store_row = conn.execute(
+            "SELECT id, device_limit FROM stores WHERE id = ?",
+            (store_id,),
+        ).fetchone()
+        if store_row is None:
+            return {}
+
+        existing = conn.execute(
+            "SELECT * FROM devices WHERE store_id = ? AND device_fingerprint = ?",
+            (store_id, fingerprint),
+        ).fetchone()
+        if existing is not None:
+            conn.execute(
+                """
+                UPDATE devices
+                SET name = ?, platform = ?, requested_at = COALESCE(NULLIF(requested_at, ''), ?)
+                WHERE id = ?
+                """,
+                (name, platform, now, existing["id"]),
+            )
+            row = conn.execute("SELECT * FROM devices WHERE id = ?", (existing["id"],)).fetchone()
+            return row_to_dict(row) or {}
+
+        current_active = _device_count(conn, store_id, active=1)
+        device_limit = int(store_row["device_limit"] or 0)
+        if current_active >= device_limit:
+            raise ValueError("Device limit reached for this shop")
+
+        row = _insert_device(
+            conn,
+            store_id=store_id,
+            name=name,
+            platform=platform,
+            device_key=uuid.uuid4().hex,
+            device_fingerprint=fingerprint,
+            active=0,
+            requested_at=now,
+        )
+    return row
+
+
+def activate_device_by_key(device_key: str) -> dict[str, Any] | None:
+    normalized = device_key.strip()
+    if not normalized:
+        return None
+    now = datetime_now()
+    with get_master_connection() as conn:
+        row = conn.execute("SELECT * FROM devices WHERE device_key = ?", (normalized,)).fetchone()
+        if row is None:
+            return None
+        store_row = conn.execute("SELECT id, device_limit FROM stores WHERE id = ?", (row["store_id"],)).fetchone()
+        if store_row is None:
+            return None
+        if int(row["active"] or 0) != 1:
+            current_active = _device_count(conn, int(row["store_id"]), active=1)
+            device_limit = int(store_row["device_limit"] or 0)
+            if current_active >= device_limit:
+                raise ValueError("Device limit reached for this shop")
+            conn.execute(
+                """
+                UPDATE devices
+                SET active = 1,
+                    approved_at = COALESCE(NULLIF(approved_at, ''), ?),
+                    last_seen = ?
+                WHERE device_key = ?
+                """,
+                (now, now, normalized),
+            )
+        conn.execute("UPDATE devices SET last_seen = ? WHERE device_key = ?", (now, normalized))
+        row = conn.execute("SELECT * FROM devices WHERE device_key = ?", (normalized,)).fetchone()
+    return row_to_dict(row)
 
 
 def list_devices(store_id: int) -> list[dict[str, Any]]:

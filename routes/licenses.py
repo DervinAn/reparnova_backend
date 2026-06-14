@@ -10,6 +10,7 @@ from database import (
     update_store_license,
 )
 from database import datetime_now
+from services.store_service import DeviceRequestInput, request_store_device_activation
 from realtime import hub
 from datetime import timedelta, datetime, timezone
 
@@ -27,6 +28,12 @@ class LicenseReactivateInput(BaseModel):
     model_config = ConfigDict(extra="ignore")
     renewalMode: str | None = None
     expiresAt: str | None = None
+
+
+class DeviceActivationResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    store: dict
+    device: dict
 
 
 def _parse_expiry(value: str | None) -> datetime | None:
@@ -119,3 +126,15 @@ def set_license_expiration(store_id: int, payload: LicenseUpdateInput) -> dict:
         raise HTTPException(status_code=500, detail="Unable to update license expiration")
     hub.publish("updated", "license", updated)
     return updated
+
+
+@router.post("/request-device")
+def request_device_activation(payload: DeviceRequestInput) -> dict:
+    try:
+        response = request_store_device_activation(payload)
+    except ValueError as exc:
+        message = str(exc)
+        status_code = 404 if "not found" in message.lower() else 409
+        raise HTTPException(status_code=status_code, detail=message) from exc
+    hub.publish("updated", "stores", response["store"])
+    return response

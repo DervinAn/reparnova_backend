@@ -2,7 +2,20 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict
 
-from database import activate_store, create_device, create_store, delete_store, get_connection, get_store_by_id, list_devices, list_stores, update_store
+from database import (
+    activate_device_by_key,
+    activate_store,
+    create_device,
+    create_store,
+    delete_store,
+    get_connection,
+    get_store_by_id,
+    get_store_by_license_key,
+    list_devices,
+    list_stores,
+    request_device_activation,
+    update_store,
+)
 
 
 class StoreCreateInput(BaseModel):
@@ -30,6 +43,14 @@ class DeviceCreateInput(BaseModel):
     platform: str = "desktop"
 
 
+class DeviceRequestInput(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    licenseKey: str
+    deviceFingerprint: str
+    deviceName: str = "Desktop"
+    platform: str = "desktop"
+
+
 class StoreSummaryOut(BaseModel):
     model_config = ConfigDict(extra="ignore")
     storeId: int
@@ -44,6 +65,7 @@ class StoreSummaryOut(BaseModel):
     customersCount: int = 0
     completedSalesTotal: float = 0.0
     deviceCount: int = 0
+    pendingDeviceCount: int = 0
     deviceLimit: int = 0
 
 
@@ -100,6 +122,9 @@ def get_store_summary(store_id: int) -> dict:
         completed_sales = conn.execute(
             "SELECT COALESCE(SUM(total), 0) AS total FROM invoices WHERE status = 'COMPLETED'"
         ).fetchone() or {"total": 0}
+        device_rows = list_devices(store_id)
+        active_devices = sum(1 for device in device_rows if int(device.get("active") or 0) == 1)
+        pending_devices = sum(1 for device in device_rows if int(device.get("active") or 0) == 0)
 
     return {
         "storeId": int(store["id"]),
@@ -113,6 +138,24 @@ def get_store_summary(store_id: int) -> dict:
         "repairsCount": int(repairs["count"]),
         "customersCount": int(customers["count"]),
         "completedSalesTotal": float(completed_sales["total"]),
-        "deviceCount": len(list_devices(store_id)),
+        "deviceCount": active_devices,
+        "pendingDeviceCount": pending_devices,
         "deviceLimit": int(store.get("device_limit") or 0),
     }
+
+
+def request_store_device_activation(input: DeviceRequestInput) -> dict:
+    store = get_store_by_license_key(input.licenseKey)
+    if store is None:
+        raise ValueError("License not found")
+    device = request_device_activation(
+        int(store["id"]),
+        name=input.deviceName,
+        platform=input.platform,
+        device_fingerprint=input.deviceFingerprint,
+    )
+    return {"store": store, "device": device}
+
+
+def activate_store_device(device_key: str) -> dict | None:
+    return activate_device_by_key(device_key)

@@ -4,6 +4,7 @@ from services.store_service import (
     DeviceCreateInput,
     StoreCreateInput,
     StoreUpdateInput,
+    activate_store_device,
     add_store_device,
     create_store_with_device,
     get_store_summary,
@@ -89,3 +90,18 @@ def create_store_device(store_id: int, payload: DeviceCreateInput) -> dict:
         return add_store_device(store_id, payload)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/{store_id}/devices/{device_key}/activate")
+def activate_store_device_route(store_id: int, device_key: str) -> dict:
+    store = get_store(store_id)
+    if store is None:
+        raise HTTPException(status_code=404, detail="Store not found")
+    try:
+        device = activate_store_device(device_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if device is None or int(device.get("store_id") or 0) != int(store_id):
+        raise HTTPException(status_code=404, detail="Device not found")
+    hub.publish("updated", "stores", store)
+    return device
