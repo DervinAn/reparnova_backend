@@ -44,6 +44,8 @@ async def on_startup() -> None:
 
 @app.middleware("http")
 async def store_context_middleware(request: Request, call_next):
+    from starlette.concurrency import run_in_threadpool
+
     path = request.url.path
     open_paths = {"/", "/health", "/api/v1/meta"}
     if path in open_paths or path.startswith("/api/v1/stores") or path.startswith("/openapi") or path.startswith("/docs") or path.startswith("/redoc"):
@@ -60,16 +62,17 @@ async def store_context_middleware(request: Request, call_next):
             from fastapi.responses import JSONResponse
 
             return JSONResponse(status_code=400, content={"detail": "Invalid X-Store-Id header"})
-    store = activate_store(code=store_code, store_id=store_id)
+    
+    store = await run_in_threadpool(activate_store, code=store_code, store_id=store_id)
 
     device_key = request.headers.get("X-Device-Key")
     if device_key:
-        device = get_device_by_key(device_key)
+        device = await run_in_threadpool(get_device_by_key, device_key)
         if device is None or int(device["store_id"]) != int(store["id"]):
             from fastapi.responses import JSONResponse
 
             return JSONResponse(status_code=401, content={"detail": "Invalid device key"})
-        touch_device(device_key)
+        await run_in_threadpool(touch_device, device_key)
 
     response = await call_next(request)
     return response
