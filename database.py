@@ -919,6 +919,8 @@ def touch_device(device_key: str) -> None:
         conn.execute("UPDATE devices SET last_seen = ? WHERE device_key = ?", (datetime_now(), device_key))
 
 
+_INITIALIZED_STORES: set[Path] = set()
+
 def activate_store(code: str | None = None, store_id: int | None = None) -> dict[str, Any]:
     store: dict[str, Any] | None = None
     if store_id is not None:
@@ -928,7 +930,9 @@ def activate_store(code: str | None = None, store_id: int | None = None) -> dict
     if store is None:
         store = ensure_default_store()
     db_path = Path(store["db_path"])
-    init_store_db(db_path)
+    if db_path not in _INITIALIZED_STORES:
+        init_store_db(db_path)
+        _INITIALIZED_STORES.add(db_path)
     set_active_store_db_path(db_path)
     set_active_store(store)
     return store
