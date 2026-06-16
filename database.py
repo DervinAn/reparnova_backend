@@ -8,7 +8,6 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
-from threading import Lock
 from typing import Any, Iterator
 
 
@@ -17,7 +16,6 @@ STORES_DIR = BASE_DIR / "stores"
 DB_PATH = Path(os.getenv("REPARNOVA_DB_PATH", BASE_DIR / "reparnova.db")).expanduser()
 MASTER_DB_PATH = Path(os.getenv("REPARNOVA_MASTER_DB_PATH", BASE_DIR / "reparnova_master.db")).expanduser()
 
-_DB_LOCK = Lock()
 _ACTIVE_DB_PATH: ContextVar[Path] = ContextVar("reparnova_active_db_path", default=DB_PATH)
 _ACTIVE_STORE: ContextVar[dict[str, Any] | None] = ContextVar("reparnova_active_store", default=None)
 
@@ -27,35 +25,36 @@ def _connect(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
 @contextmanager
 def get_connection() -> Iterator[sqlite3.Connection]:
-    with _DB_LOCK:
-        conn = _connect(_ACTIVE_DB_PATH.get())
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+    conn = _connect(_ACTIVE_DB_PATH.get())
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 @contextmanager
 def get_master_connection() -> Iterator[sqlite3.Connection]:
-    with _DB_LOCK:
-        conn = _connect(MASTER_DB_PATH)
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+    conn = _connect(MASTER_DB_PATH)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def set_active_store_db_path(path: Path) -> None:
@@ -933,6 +932,21 @@ def touch_device(device_key: str) -> None:
 
 _INITIALIZED_STORES: set[Path] = set()
 
+
+def _db_has_operational_data(path: Path) -> bool:
+    if not path.exists():
+        return False
+    tables = ("products", "invoices", "customers", "repairs", "expenses", "spare_parts", "product_bundles")
+    try:
+        with _connect(path) as conn:
+            for table in tables:
+                row = conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
+                if row is not None and int(row["count"] or 0) > 0:
+                    return True
+    except sqlite3.Error:
+        return False
+    return False
+
 def activate_store(code: str | None = None, store_id: int | None = None) -> dict[str, Any]:
     store: dict[str, Any] | None = None
     if store_id is not None:
@@ -942,10 +956,22 @@ def activate_store(code: str | None = None, store_id: int | None = None) -> dict
     if store is None:
         store = ensure_default_store()
     db_path = Path(store["db_path"])
+    resolved_db_path = db_path
+    # Some legacy shops were created before the store DB was migrated, so their
+    # master record points at an empty file while the real operational data is
+    # still in the populated base database. Fall back to the populated base DB
+    # in that case so the shop details page shows the correct data.
+    if store.get("code") != "default" and db_path != DB_PATH:
+        if not _db_has_operational_data(db_path) and _db_has_operational_data(DB_PATH):
+            resolved_db_path = DB_PATH
     if db_path not in _INITIALIZED_STORES:
         init_store_db(db_path)
         _INITIALIZED_STORES.add(db_path)
-    set_active_store_db_path(db_path)
+    if resolved_db_path not in _INITIALIZED_STORES:
+        init_store_db(resolved_db_path)
+        _INITIALIZED_STORES.add(resolved_db_path)
+    set_active_store_db_path(resolved_db_path)
+    store = {**store, "db_path": str(resolved_db_path)}
     set_active_store(store)
     return store
 
